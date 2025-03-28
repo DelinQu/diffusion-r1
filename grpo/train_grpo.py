@@ -19,7 +19,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from transformers import CLIPModel, CLIPProcessor, HfArgumentParser, is_torch_npu_available, is_torch_xpu_available
-from trl import DDPOConfig, DDPOTrainer
+from grpo_config import GRPOConfig
+from grpo_sd_trainer import GRPOTrainer
 from modeling_sd_base import DefaultDDPOStableDiffusionPipeline
 from datetime import datetime
 import logging
@@ -188,7 +189,7 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((ScriptArguments, DDPOConfig))
+    parser = HfArgumentParser((ScriptArguments, GRPOConfig))
     script_args, training_args = parser.parse_args_into_dataclasses()
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -215,7 +216,7 @@ if __name__ == "__main__":
         use_lora=script_args.use_lora,
     )
 
-    trainer = DDPOTrainer(
+    trainer = GRPOTrainer(
         training_args,
         aesthetic_scorer(script_args.hf_hub_aesthetic_model_id, script_args.hf_hub_aesthetic_model_filename),
         prompt_fn,

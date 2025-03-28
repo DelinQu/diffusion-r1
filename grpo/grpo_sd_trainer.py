@@ -28,7 +28,7 @@ from transformers import is_wandb_available
 
 from trl import DDPOStableDiffusionPipeline
 from trl.trainer.utils import PerPromptStatTracker, generate_model_card, get_comet_experiment_url
-from grpo_config import DDPOConfig
+from grpo_config import GRPOConfig
 
 
 if is_wandb_available():
@@ -38,9 +38,9 @@ if is_wandb_available():
 logger = get_logger(__name__)
 
 
-class DDPOTrainer(PyTorchModelHubMixin):
+class GRPOTrainer(PyTorchModelHubMixin):
     """
-    The DDPOTrainer uses Deep Diffusion Policy Optimization to optimise diffusion models.
+    The GRPOTrainer uses Deep Diffusion Policy Optimization to optimise diffusion models.
     Note, this trainer is heavily inspired by the work here: https://github.com/kvablack/ddpo-pytorch
     As of now only Stable Diffusion based pipelines are supported
 
@@ -57,7 +57,7 @@ class DDPOTrainer(PyTorchModelHubMixin):
 
     def __init__(
         self,
-        config: DDPOConfig,
+        config: GRPOConfig,
         reward_function: Callable[[torch.Tensor, tuple[str], tuple[Any]], torch.Tensor],
         prompt_function: Callable[[], tuple[str, Any]],
         sd_pipeline: DDPOStableDiffusionPipeline,
@@ -251,25 +251,42 @@ class DDPOTrainer(PyTorchModelHubMixin):
             self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
 
         rewards = torch.cat(rewards)
-        rewards = self.accelerator.gather(rewards).cpu().numpy()
+        rewards = self.accelerator.gather(rewards) # (total_batch_size,)
 
+        # Apply weights to each reward function's output and sum
+        # rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        _rewards = rewards.cpu().numpy()
         self.accelerator.log(
             {
-                "reward": rewards,
+                "reward": _rewards,
                 "epoch": epoch,
-                "reward_mean": rewards.mean(),
-                "reward_std": rewards.std(),
+                "reward_mean": _rewards.mean(),
+                "reward_std": _rewards.std(),
             },
             step=global_step,
         )
 
-        if self.config.per_prompt_stat_tracking:
-            # gather the prompts across processes
-            prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().numpy()
-            prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
-            advantages = self.stat_tracker.update(prompts, rewards)
-        else:
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        # if self.config.per_prompt_stat_tracking:
+        #     # gather the prompts across processes
+        #     prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+        #     prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+        #     advantages = self.stat_tracker.update(prompts, rewards)
+        # else:
+        #     advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+        # Apply weights to each reward function's output and sum
+        # rewards = (rewards * self.reward_weights.to(self.accelerator.device).unsqueeze(0)).nansum(dim=1)
+
+        # Compute grouped-wise rewards
+        mean_grouped_rewards = rewards.view(-1, self.config.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, self.config.num_generations).std(dim=1)
+
+        # Normalize the rewards to compute the advantages
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.config.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.config.num_generations, dim=0)
+        advantages = rewards - mean_grouped_rewards
+        if self.config.scale_rewards:
+            advantages = advantages / (std_grouped_rewards + 1e-4)
 
         # ungather advantages;  keep the entries corresponding to the samples on this process
         samples["advantages"] = (
@@ -281,7 +298,6 @@ class DDPOTrainer(PyTorchModelHubMixin):
         del samples["prompt_ids"]
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
-
         for inner_epoch in range(self.config.train_num_inner_epochs):
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=self.accelerator.device)
@@ -322,7 +338,7 @@ class DDPOTrainer(PyTorchModelHubMixin):
 
         return global_step
 
-    def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
+    def calculate_loss(self, latents, timesteps, next_latents, old_log_probs, advantages, embeds):
         """
         Calculate the loss for a batch of an unpacked sample
 
@@ -372,23 +388,34 @@ class DDPOTrainer(PyTorchModelHubMixin):
                 prev_sample=next_latents,
             )
 
-            log_prob = scheduler_step_output.log_probs
+            log_probs = scheduler_step_output.log_probs
 
-        advantages = torch.clamp(
-            advantages,
-            -self.config.train_adv_clip_max,
-            self.config.train_adv_clip_max,
-        )
+        advantages = torch.clamp(advantages, -self.config.train_adv_clip_max, self.config.train_adv_clip_max)
+        # ratio = torch.exp(log_probs - old_log_probs)
+        # loss = self.loss(advantages, self.config.train_clip_range, ratio)
+        # clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
+        # approx_kl = 0.5 * torch.mean((log_probs - old_log_probs) ** 2)
 
-        ratio = torch.exp(log_prob - log_probs)
+        # grpo loss
+        coef_1 = torch.exp(log_probs - old_log_probs)
+        coef_2 = torch.clamp(coef_1, 1 - self.config.epsilon, 1 + self.config.epsilon_high)
+        per_sample_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_sample_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_sample_loss = -torch.min(per_sample_loss1, per_sample_loss2)
 
-        loss = self.loss(advantages, self.config.train_clip_range, ratio)
+        # compute KL divergence between model and reference
+        if self.config.beta != 0.0:
+            ref_per_token_logps = old_log_probs
+            per_sample_kl = torch.exp(ref_per_token_logps - log_probs) - (ref_per_token_logps - log_probs) - 1
+            per_sample_loss = per_sample_loss + self.config.beta * per_sample_kl
+            mean_kl = per_sample_kl.mean()
+        
+        loss = per_sample_loss.mean()
+        
+        is_clipped = (coef_1 < (1 - self.config.epsilon)) | (coef_1 > (1 + self.config.epsilon_high))
+        clip_ratio = is_clipped.float().mean()
 
-        approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
-
-        clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
-
-        return loss, approx_kl, clipfrac
+        return loss, mean_kl, clip_ratio
 
     def loss(
         self,
@@ -466,7 +493,6 @@ class DDPOTrainer(PyTorchModelHubMixin):
                     eta=self.config.sample_eta,
                     output_type="pt",
                 )
-
                 images = sd_output.images
                 latents = sd_output.latents
                 log_probs = sd_output.log_probs
@@ -642,7 +668,7 @@ class DDPOTrainer(PyTorchModelHubMixin):
             tags=tags,
             wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
             comet_url=get_comet_experiment_url(),
-            trainer_name="DDPO",
+            trainer_name="GRPO",
             trainer_citation=citation,
             paper_title="Training Diffusion Models with Reinforcement Learning",
             paper_id="2305.13301",

@@ -23,9 +23,9 @@ from trl.core import flatten_dict
 
 
 @dataclass
-class DDPOConfig:
+class GRPOConfig:
     r"""
-    Configuration class for the [`DDPOTrainer`].
+    Configuration class for the [`GRPOTrainer`].
 
     Using [`~transformers.HfArgumentParser`] we can turn this class into
     [argparse](https://docs.python.org/3/library/argparse#module-argparse) arguments that can be specified on the
@@ -284,6 +284,39 @@ class DDPOConfig:
         default=False,
         metadata={"help": "Whether to push the final model checkpoint to the Hub."},
     )
+    # grpo
+    num_generations: int = field(
+        default=2,
+        metadata={"help": "Number of generations of each group."},
+    )
+    scale_rewards: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to scale the rewards by dividing them by their standard deviation. If `True` (default), "
+            "the rewards are normalized by the standard deviation, ensuring they have unit variance. If `False`, no "
+            "scaling is applied. The Dr. GRPO paper recommends not scaling the rewards, as scaling by the standard "
+            "deviation introduces a question-level difficulty bias."
+        },
+    )
+    beta: float = field(
+        default=0.04,
+        metadata={
+            "help": "KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving "
+            "training speed, but may be numerically unstable for long training runs."
+        },
+    )
+    epsilon: float = field(
+        default=0.2,
+        metadata={"help": "Epsilon value for clipping."},
+    )
+    epsilon_high: Optional[float] = field(
+        default=0.2,
+        metadata={
+            "help": "Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the "
+            "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`."
+        },
+    )
+
 
     def to_dict(self):
         output_dict = {}
