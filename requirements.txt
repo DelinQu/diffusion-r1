@@ -6,3 +6,4 @@ torchvision
 wandb
 image-reward
 clip @ git+https://github.com/openai/CLIP.git
+vision-reward
